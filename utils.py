@@ -2,9 +2,11 @@ import sys
 import os
 import logging
 import asyncio
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from telegram.error import Forbidden, NetworkError, TimedOut, BadRequest, RetryAfter
 from config import CHANNEL_ID, LOG_PATH
+
 
 # === КРАСИВАЯ СИСТЕМА ЛОГГИРОВАНИЯ ===
 class BeautifulFormatter(logging.Formatter):
@@ -93,6 +95,7 @@ class BeautifulFormatter(logging.Formatter):
         
         return '📝'
 
+
 def setup_logging():
     """Настройка красивого логирования"""
     
@@ -129,30 +132,29 @@ def setup_logging():
     
     return logger
 
+
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С КАНАЛОМ ===
-async def check_bot_permissions(app):
+
+async def check_bot_permissions(bot, channel_id: str):
     """Проверка прав бота в канале"""
     try:
-        chat = await app.bot.get_chat(CHANNEL_ID)
+        chat = await bot.get_chat(channel_id)
         logging.info(f"✅ Канал найден: {chat.title}")
         
-        # Получаем информацию о боте в канале
-        bot_info = await app.bot.get_me()
-        try:
-            member = await app.bot.get_chat_member(CHANNEL_ID, bot_info.id)
-            if member.status in ['administrator', 'creator']:
-                logging.info("✅ Бот является администратором канала")
-                return True
-            else:
-                logging.warning("⚠️ Бот не является администратором канала")
-                return False
-        except Exception as e:
-            logging.error(f"❌ Бот не является участником канала: {e}")
+        bot_info = await bot.get_me()
+        member = await bot.get_chat_member(channel_id, bot_info.id)
+        
+        if member.status in ['administrator', 'creator']:
+            logging.info("✅ Бот является администратором канала")
+            return True
+        else:
+            logging.warning("⚠️ Бот не является администратором канала")
             return False
             
     except Exception as e:
-        logging.error(f"❌ Ошибка доступа к каналу: {e}")
+        logging.error(f"❌ Ошибка доступа к каналу {channel_id}: {e}")
         return False
+
 
 async def send_message_with_fallback(app, chat_id: str, text: str, max_retries: int = 3) -> bool:
     """Отправка сообщения с обработкой ошибок и повторными попытками"""
@@ -163,26 +165,24 @@ async def send_message_with_fallback(app, chat_id: str, text: str, max_retries: 
         except Forbidden as e:
             logging.error(f"❌ Ошибка доступа (попытка {attempt + 1}): {e}")
             if "bot is not a member" in str(e):
-                # Критическая ошибка - бот не в канале
                 raise e
             await asyncio.sleep(2)
         except (NetworkError, TimedOut) as e:
             logging.warning(f"⚠️ Сетевая ошибка (попытка {attempt + 1}): {e}")
             await asyncio.sleep(2)
         except RetryAfter as e:
-            # Telegram просит подождать
             wait_time = e.retry_after
             logging.warning(f"⏰ Rate limit, ждем {wait_time} секунд (попытка {attempt + 1})")
             await asyncio.sleep(wait_time)
         except BadRequest as e:
             logging.error(f"❌ Неверный запрос (попытка {attempt + 1}): {e}")
-            # Для BadRequest обычно нет смысла повторять
             return False
         except Exception as e:
             logging.error(f"❌ Неизвестная ошибка (попытка {attempt + 1}): {e}")
             await asyncio.sleep(2)
     
     return False
+
 
 async def send_message_safe(app, chat_id: str, text: str, **kwargs) -> bool:
     """Безопасная отправка сообщения с расширенными параметрами"""
@@ -199,6 +199,7 @@ async def send_message_safe(app, chat_id: str, text: str, **kwargs) -> bool:
         logging.error(f"❌ Ошибка отправки сообщения: {e}")
         return False
 
+
 async def edit_message_safe(app, chat_id: str, message_id: int, text: str, **kwargs) -> bool:
     """Безопасное редактирование сообщения"""
     try:
@@ -207,6 +208,7 @@ async def edit_message_safe(app, chat_id: str, message_id: int, text: str, **kwa
     except Exception as e:
         logging.error(f"❌ Ошибка редактирования сообщения: {e}")
         return False
+
 
 async def delete_message_safe(app, chat_id: str, message_id: int) -> bool:
     """Безопасное удаление сообщения"""
@@ -217,7 +219,9 @@ async def delete_message_safe(app, chat_id: str, message_id: int) -> bool:
         logging.error(f"❌ Ошибка удаления сообщения: {e}")
         return False
 
+
 # === ФУНКЦИИ ДЛЯ РАБОТЫ С ВРЕМЕНЕМ ===
+
 def format_timedelta(delta) -> str:
     """Форматирование временного интервала в читаемый вид"""
     total_seconds = int(delta.total_seconds())
@@ -230,6 +234,7 @@ def format_timedelta(delta) -> str:
         return f"{minutes}м {seconds}с"
     else:
         return f"{seconds}с"
+
 
 def get_next_post_time(post_time, current_time=None):
     """Получение времени следующего поста"""
@@ -244,46 +249,53 @@ def get_next_post_time(post_time, current_time=None):
     
     return target_time
 
+
 def is_time_close(target_time, tolerance_minutes=10):
     """Проверка, близко ли текущее время к целевому"""
     current_time = datetime.now()
     time_diff = abs((target_time - current_time).total_seconds())
     return time_diff <= tolerance_minutes * 60
 
+
 # === ФУНКЦИИ ДЛЯ РАБОТЫ С ТЕКСТОМ ===
+
 def truncate_text(text: str, max_length: int, suffix: str = "...") -> str:
     """Обрезка текста до максимальной длины"""
     if len(text) <= max_length:
         return text
     return text[:max_length - len(suffix)] + suffix
 
+
 def escape_markdown(text: str) -> str:
     """Экранирование символов Markdown"""
     escape_chars = r'\_*[]()~`>#+-=|{}.!'
     return ''.join(['\\' + char if char in escape_chars else char for char in text])
+
 
 def clean_username(username: str) -> str:
     """Очистка имени пользователя"""
     if not username:
         return "анонимный пользователь"
     
-    # Удаляем @ в начале если есть
     if username.startswith('@'):
         username = username[1:]
     
-    # Заменяем недопустимые символы
     username = re.sub(r'[^\w]', '_', username)
     
     return username if username else "пользователь"
 
+
 # === ФУНКЦИИ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ===
+
 def get_today_date() -> str:
     """Получение сегодняшней даты в формате для БД"""
     return datetime.now().date().isoformat()
 
+
 def get_current_datetime() -> datetime:
     """Получение текущего datetime"""
     return datetime.now()
+
 
 def datetime_from_isoformat(iso_string: str) -> datetime:
     """Безопасное создание datetime из ISO строки"""
@@ -292,29 +304,26 @@ def datetime_from_isoformat(iso_string: str) -> datetime:
     except (ValueError, TypeError):
         return datetime.now()
 
+
 # === ФУНКЦИИ ДЛЯ СТАТИСТИКИ ===
+
 async def get_bot_usage_stats(db) -> dict:
     """Получение статистики использования бота"""
     cursor = db.conn.cursor()
     
     try:
-        # Общее количество сообщений
         cursor.execute('SELECT COUNT(*) FROM message_history')
         total_messages = cursor.fetchone()[0]
         
-        # Сообщения за сегодня
         cursor.execute('SELECT COUNT(*) FROM message_history WHERE date(timestamp) = date("now")')
         today_messages = cursor.fetchone()[0]
         
-        # Заблокированный спам
         cursor.execute('SELECT COUNT(*) FROM message_history WHERE is_spam = TRUE')
         spam_blocked = cursor.fetchone()[0]
         
-        # Уникальные пользователи
         cursor.execute('SELECT COUNT(DISTINCT user_id) FROM user_activity')
         unique_users = cursor.fetchone()[0]
         
-        # Активные пользователи (за последние 7 дней)
         cursor.execute('''
             SELECT COUNT(DISTINCT user_id) FROM user_activity 
             WHERE date(last_activity) >= date("now", "-7 days")
@@ -333,12 +342,11 @@ async def get_bot_usage_stats(db) -> dict:
         logging.error(f"❌ Ошибка получения статистики: {e}")
         return {}
 
+
 async def get_channel_stats(app, channel_id: str) -> dict:
     """Получение статистики канала"""
     try:
         chat = await app.bot.get_chat(channel_id)
-        
-        # Получаем количество участников (если доступно)
         try:
             members_count = await app.bot.get_chat_members_count(channel_id)
         except:
@@ -355,12 +363,15 @@ async def get_channel_stats(app, channel_id: str) -> dict:
         logging.error(f"❌ Ошибка получения статистики канала: {e}")
         return {}
 
+
 # === ФУНКЦИИ ДЛЯ ОБРАБОТКИ ОШИБОК ===
+
 def handle_async_error(task: asyncio.Task, context: str = ""):
     """Обработка ошибок в асинхронных задачах"""
     if task.exception():
         exception = task.exception()
         logging.error(f"❌ Ошибка в асинхронной задаче {context}: {exception}")
+
 
 async def safe_execute(coroutine, context: str = "", default_return=None):
     """Безопасное выполнение корутины с обработкой ошибок"""
@@ -370,37 +381,34 @@ async def safe_execute(coroutine, context: str = "", default_return=None):
         logging.error(f"❌ Ошибка при выполнении {context}: {e}")
         return default_return
 
+
 # === ФУНКЦИИ ДЛЯ ВАЛИДАЦИИ ===
+
 def is_valid_channel_id(channel_id: str) -> bool:
     """Проверка валидности ID канала"""
     if not channel_id:
         return False
-    
-    # ID канала обычно начинается с -100
     if channel_id.startswith('-100'):
         try:
             int(channel_id)
             return True
         except ValueError:
             return False
-    
     return False
+
 
 def is_valid_user_id(user_id: int) -> bool:
     """Проверка валидности ID пользователя"""
     return user_id is not None and user_id > 0
 
+
 def is_valid_text(text: str, min_length: int = 1, max_length: int = 4000) -> bool:
     """Проверка валидности текста"""
     if not text or not isinstance(text, str):
         return False
-    
     text = text.strip()
     return min_length <= len(text) <= max_length
 
-# Импорты для функций
-import re
-from datetime import timedelta
 
 # Инициализация логгера
 logger = setup_logging()

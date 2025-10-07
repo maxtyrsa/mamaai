@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, time as dt_time, timedelta
+from typing import Dict, List, Optional, Tuple
 from config import MORNING_POST_TIME, EVENING_POST_TIME, Config, CHANNEL_ID
 from utils import send_message_with_fallback
 

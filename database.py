@@ -1,6 +1,7 @@
 import sqlite3
 import logging
 from datetime import datetime
+from typing import Optional
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)

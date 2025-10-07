@@ -2,7 +2,7 @@ import re
 import json
 import random
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from datetime import datetime, timedelta
 from config import Config
 
