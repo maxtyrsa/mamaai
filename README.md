@@ -43,7 +43,7 @@ pip install python-telegram-bot llama-cpp-python
 
 Отредактируйте config.py:
 
-```
+```python
 BOT_TOKEN = "your_bot_token_here"
 CHANNEL_ID = "-100your_channel_id_here"
 ```
