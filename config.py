@@ -15,8 +15,8 @@ LOG_PATH = os.path.join(SCRIPT_DIR, 'bot_errors.log')
 MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "YandexGPT-5-Lite-8B-instruct.Q4_K_M.gguf")
 
 # Настройки бота
-BOT_TOKEN = "8261699857:AAEtqvaGETzjqN2SnZK1q53GEboaOAyV7xA"
-CHANNEL_ID = "-1002126028964"
+BOT_TOKEN = "TOKEN TELEGRAM BOT"
+CHANNEL_ID = "ID CHANNEL"
 
 # Расписание автоматических постов
 MORNING_POST_TIME = dt_time(9, 0)   # 09:00 утра
