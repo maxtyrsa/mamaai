@@ -36,6 +36,7 @@
 - Доступ к Telegram каналу
 
 ### Установка зависимостей
+
 ```bash
 pip install python-telegram-bot llama-cpp-python
 
