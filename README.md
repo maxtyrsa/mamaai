@@ -43,6 +43,7 @@ pip install python-telegram-bot llama-cpp-python
 Настройка конфигурации
 
 Отредактируйте config.py:
+```
 
 ```python
 BOT_TOKEN = "your_bot_token_here"
