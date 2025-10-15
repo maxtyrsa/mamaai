@@ -18,6 +18,101 @@ from keyboards import (
 
 logger = logging.getLogger(__name__)
 
+# Вспомогательные функции для фильтрации
+async def is_admin_user(bot, user_id: int, chat_id: str) -> bool:
+    """Проверяет, является ли пользователь администратором канала"""
+    try:
+        administrators = await bot.get_chat_administrators(chat_id)
+        admin_ids = [admin.user.id for admin in administrators if admin.user]
+        return user_id in admin_ids
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки прав администратора: {e}")
+        return False
+
+async def is_channel_post(message) -> bool:
+    """Проверяет, является ли сообщение постом канала"""
+    if not message:
+        return False
+    
+    # Проверяем, что сообщение отправлено от имени канала
+    if hasattr(message, 'sender_chat') and message.sender_chat:
+        return message.sender_chat.id == int(CHANNEL_ID)
+    
+    return False
+
+def is_auto_post_message(text: str) -> bool:
+    """Улучшенная проверка на авто-посты бота"""
+    if not text:
+        return False
+    
+    text_lower = text.lower().strip()
+    
+    # Только точные совпадения с началом авто-постов
+    auto_post_starts = [
+        "просыпайтесь с улыбкой",
+        "новый день - новые возможности",
+        "доброе утро",
+        "вечер накрывает город",
+        "спокойной ночи", 
+        "🧪 тестовый пост",
+        "☀️ новое утро — новые возможности",
+        "🌙 вечер наступает",
+        "✨ день подходит к концу",
+        "🌅 утро — время планировать"
+    ]
+    
+    # Проверяем только начало сообщения для точного определения
+    for phrase in auto_post_starts:
+        if text_lower.startswith(phrase.lower()):
+            logger.info(f"⏩ Точное совпадение с авто-постом: {phrase}")
+            return True
+    
+    # Дополнительные проверки с более строгими условиями
+    morning_indicators = ['утро', 'утрен', 'доброе утро', 'просыпай', 'новый день', 'солнц', 'рассвет']
+    evening_indicators = ['вечер', 'ночь', 'сон', 'отдых', 'спокойной', 'закат', 'луна', 'звезд', 'расслаб', 'восстанов']
+    
+    # Считаем сообщение авто-постом только если есть несколько индикаторов И текст похож на авто-пост
+    morning_count = sum(1 for indicator in morning_indicators if indicator in text_lower)
+    evening_count = sum(1 for indicator in evening_indicators if indicator in text_lower)
+    
+    # Только если есть несколько индикаторов И текст достаточно длинный (как авто-пост)
+    if (morning_count >= 2 or evening_count >= 2) and len(text) > 100:
+        logger.info(f"⏩ Определен как авто-пост по индикаторам: утро={morning_count}, вечер={evening_count}")
+        return True
+    
+    return False
+
+async def should_process_message(message) -> bool:
+    """Улучшенная проверка необходимости обработки сообщения"""
+    if not message or not message.text:
+        logger.info("⏩ Пропущено пустое сообщение")
+        return False
+    
+    text = message.text.strip()
+    if not text:
+        logger.info("⏩ Пропущено сообщение с пустым текстом")
+        return False
+    
+    user_info = f"{message.from_user.first_name or 'Аноним'} ({message.from_user.id})"
+    
+    # Пропускаем посты канала
+    if await is_channel_post(message):
+        logger.info(f"⏩ Пропущен пост канала от {user_info}: {text[:50]}...")
+        return False
+    
+    # Пропускаем автоматические посты бота (более точная проверка)
+    if is_auto_post_message(text):
+        logger.info(f"⏩ Пропущен авто-пост от {user_info}: {text[:50]}...")
+        return False
+    
+    # Пропускаем очень короткие сообщения (возможно, артефакты)
+    if len(text) < 2:
+        logger.info(f"⏩ Пропущено слишком короткое сообщение от {user_info}: '{text}'")
+        return False
+    
+    logger.info(f"✅ Сообщение будет обработано от {user_info}: {text[:50]}...")
+    return True
+
 class NotificationSystem:
     def __init__(self, app, db):
         self.app = app
@@ -228,6 +323,265 @@ class PostCreator:
             parse_mode='Markdown'
         )
 
+    async def generate_post_from_plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE, plan_id: int, post_index: int = 0):
+        """Генерация поста из контент-плана"""
+        user = update.effective_user
+        query = update.callback_query
+        
+        try:
+            # Получаем контент-план из базы
+            cursor = self.db.conn.cursor()
+            cursor.execute('''
+                SELECT plan_data FROM content_plans 
+                WHERE id = ? AND user_id = ?
+            ''', (plan_id, user.id))
+            
+            result = cursor.fetchone()
+            if not result:
+                await query.edit_message_text("❌ Контент-план не найден")
+                return
+            
+            plan_data = json.loads(result[0]) if result[0] else {}
+            posts = plan_data.get('plan', [])
+            
+            if not posts:
+                await query.edit_message_text("❌ В контент-плане нет постов")
+                return
+            
+            if post_index >= len(posts):
+                await query.edit_message_text("❌ Указанный пост не найден в плане")
+                return
+            
+            post_data = posts[post_index]
+            
+            await query.edit_message_text("🤖 Генерирую пост из контент-плана... ⏳")
+            
+            # Генерируем пост на основе данных из контент-плана
+            generated_post = await self.response_generator.generate_post_from_plan_data(post_data)
+            
+            if not generated_post:
+                await query.edit_message_text("❌ Не удалось сгенерировать пост")
+                return
+            
+            # Предлагаем действия с постом
+            keyboard = [
+                [InlineKeyboardButton("⏰ Опубликовать сейчас", callback_data=f"publish_plan_post_{plan_id}_{post_index}")],
+                [InlineKeyboardButton("📅 Запланировать", callback_data=f"schedule_plan_post_{plan_id}_{post_index}")],
+                [InlineKeyboardButton("🔄 Сгенерировать другой", callback_data=f"regenerate_plan_post_{plan_id}_{post_index}")],
+                [InlineKeyboardButton("📋 К контент-плану", callback_data=f"plan_nav_{post_index}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            post_info = f"**Тема:** {post_data.get('topic', 'Без темы')}\n"
+            post_info += f"**Тип:** {post_data.get('post_type', 'Не указан')}\n"
+            post_info += f"**Тон:** {post_data.get('tone', 'Не указан')}\n\n"
+            
+            await query.edit_message_text(
+                f"📝 **Сгенерированный пост из контент-плана:**\n\n"
+                f"{post_info}"
+                f"{generated_post}\n\n"
+                f"Выберите действие:",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации поста из контент-плана: {e}")
+            await query.edit_message_text("❌ Ошибка при генерации поста")
+
+    async def publish_plan_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE, plan_id: int, post_index: int):
+        """Публикация поста из контент-плана"""
+        user = update.effective_user
+        query = update.callback_query
+        
+        try:
+            # Получаем контент-план и данные поста
+            cursor = self.db.conn.cursor()
+            cursor.execute('''
+                SELECT plan_data, plan_name FROM content_plans 
+                WHERE id = ? AND user_id = ?
+            ''', (plan_id, user.id))
+            
+            result = cursor.fetchone()
+            if not result:
+                await query.edit_message_text("❌ Контент-план не найден")
+                return
+            
+            plan_data_json, plan_name = result
+            plan_data = json.loads(plan_data_json) if plan_data_json else {}
+            posts = plan_data.get('plan', [])
+            
+            if post_index >= len(posts):
+                await query.edit_message_text("❌ Указанный пост не найден в плане")
+                return
+            
+            post_data = posts[post_index]
+            
+            # Генерируем пост
+            generated_post = await self.response_generator.generate_post_from_plan_data(post_data)
+            
+            if not generated_post:
+                await query.edit_message_text("❌ Не удалось сгенерировать пост")
+                return
+            
+            # Публикуем пост
+            success = await send_message_with_fallback(context.application, CHANNEL_ID, generated_post)
+            
+            if success:
+                # Сохраняем в базу как опубликованный пост
+                cursor = self.db.execute_with_datetime('''
+                    INSERT INTO scheduled_posts 
+                    (user_id, post_text, scheduled_time, channel_id, tone, topic, length, main_idea, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user.id,
+                    generated_post,
+                    datetime.now(),
+                    CHANNEL_ID,
+                    post_data.get('tone', 'friendly'),
+                    post_data.get('topic', 'Без темы'),
+                    'medium',
+                    post_data.get('main_idea', 'Без описания'),
+                    'published'
+                ))
+                self.db.conn.commit()
+                
+                post_id = cursor.lastrowid
+                
+                await query.edit_message_text(
+                    f"✅ **Пост опубликован!**\n\n"
+                    f"📝 Тема: {post_data.get('topic', 'Без темы')}\n"
+                    f"📅 Из плана: {plan_name}\n"
+                    f"🆔 ID поста: {post_id}\n\n"
+                    f"Пост успешно опубликован в канале! 🎉",
+                    parse_mode='Markdown'
+                )
+                logger.info(f"✅ Пост {post_id} из контент-плана {plan_id} опубликован")
+            else:
+                await query.edit_message_text("❌ Не удалось опубликовать пост")
+                
+        except Forbidden as e:
+            if "bot is not a member" in str(e):
+                await query.edit_message_text(
+                    "❌ Бот не добавлен в канал!\n\n"
+                    "Добавьте бота в канал как администратора."
+                )
+            else:
+                await query.edit_message_text("❌ Ошибка при публикации поста")
+            logger.error(f"❌ Ошибка публикации поста из контент-плана: {e}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка публикации поста из контент-плана: {e}")
+            await query.edit_message_text("❌ Ошибка при публикации поста")
+
+    async def schedule_plan_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE, plan_id: int, post_index: int):
+        """Планирование поста из контент-плана"""
+        user = update.effective_user
+        query = update.callback_query
+        
+        # Сохраняем данные для следующего шага
+        context.user_data['scheduling_plan_post'] = True
+        context.user_data['plan_id'] = plan_id
+        context.user_data['post_index'] = post_index
+        
+        await query.edit_message_text(
+            "⏰ **Планирование публикации поста из контент-плана**\n\n"
+            "Введите время публикации:\n\n"
+            "• **Сейчас** - опубликовать немедленно\n"
+            "• **Через 2 часа** - через указанное время\n"
+            "• **Завтра 15:30** - конкретное время\n"
+            "• **01.01.2024 10:00** - конкретная дата и время",
+            parse_mode='Markdown'
+        )
+
+    async def handle_plan_post_scheduling(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка планирования поста из контент-плана"""
+        if not context.user_data.get('scheduling_plan_post'):
+            return
+        
+        user = update.effective_user
+        message = update.effective_message
+        plan_id = context.user_data.get('plan_id')
+        post_index = context.user_data.get('post_index')
+        
+        try:
+            schedule_time = self.parse_schedule_time(message.text)
+            if not schedule_time:
+                await message.reply_text(
+                    "❌ Не удалось распознать время. Используйте: 'сейчас', 'через 2 часа', 'завтра 09:00'",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Получаем контент-план и данные поста
+            cursor = self.db.conn.cursor()
+            cursor.execute('''
+                SELECT plan_data, plan_name FROM content_plans 
+                WHERE id = ? AND user_id = ?
+            ''', (plan_id, user.id))
+            
+            result = cursor.fetchone()
+            if not result:
+                await message.reply_text("❌ Контент-план не найден")
+                context.user_data.clear()
+                return
+            
+            plan_data_json, plan_name = result
+            plan_data = json.loads(plan_data_json) if plan_data_json else {}
+            posts = plan_data.get('plan', [])
+            
+            if post_index >= len(posts):
+                await message.reply_text("❌ Указанный пост не найден в плане")
+                context.user_data.clear()
+                return
+            
+            post_data = posts[post_index]
+            
+            # Генерируем пост
+            generated_post = await self.response_generator.generate_post_from_plan_data(post_data)
+            
+            if not generated_post:
+                await message.reply_text("❌ Не удалось сгенерировать пост")
+                context.user_data.clear()
+                return
+            
+            # Сохраняем запланированный пост
+            cursor = self.db.execute_with_datetime('''
+                INSERT INTO scheduled_posts 
+                (user_id, post_text, scheduled_time, channel_id, tone, topic, length, main_idea, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user.id,
+                generated_post,
+                schedule_time,
+                CHANNEL_ID,
+                post_data.get('tone', 'friendly'),
+                post_data.get('topic', 'Без темы'),
+                'medium',
+                post_data.get('main_idea', 'Без описания'),
+                'scheduled'
+            ))
+            self.db.conn.commit()
+            
+            post_id = cursor.lastrowid
+            
+            context.user_data.clear()
+            
+            await message.reply_text(
+                f"✅ **Пост запланирован!**\n\n"
+                f"📝 Тема: {post_data.get('topic', 'Без темы')}\n"
+                f"📅 Из плана: {plan_name}\n"
+                f"⏰ Время: {schedule_time.strftime('%d.%m.%Y %H:%M')}\n"
+                f"🆔 ID поста: {post_id}\n\n"
+                f"Пост будет опубликован автоматически в указанное время! 🎉",
+                parse_mode='Markdown'
+            )
+            logger.info(f"✅ Пост {post_id} из контент-плана {plan_id} запланирован на {schedule_time}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка планирования поста из контент-плана: {e}")
+            await message.reply_text("❌ Ошибка при планировании поста")
+            context.user_data.clear()
+
 class ContentPlanManager:
     def __init__(self, response_generator, db):
         self.response_generator = response_generator
@@ -240,8 +594,8 @@ class ContentPlanManager:
         context.user_data['content_plan_stage'] = 'niche'
         
         await update.callback_query.edit_message_text(
-            f"�� **Создание {plan_type} контент-плана**\n\n"
-            "🎯 **Шаг 1 из 3:** Введите нишу вашего канала:",
+            f"📅 **Создание {plan_type} контент-плана**\n\n"
+            "🎯 **Шаг 1 из 4:** Введите нишу вашего канала:",
             parse_mode='Markdown'
         )
     
@@ -257,12 +611,22 @@ class ContentPlanManager:
         
         if stage == 'niche':
             context.user_data['content_plan_niche'] = message.text
+            context.user_data['content_plan_stage'] = 'audience'
+            
+            await message.reply_text(
+                "👥 **Шаг 2 из 4:** Опишите целевую аудиторию канала:\n\n"
+                "Например: 'молодые предприниматели', 'IT-специалисты', 'студенты' и т.д.",
+                parse_mode='Markdown'
+            )
+        
+        elif stage == 'audience':
+            context.user_data['content_plan_audience'] = message.text
             context.user_data['content_plan_stage'] = 'tone'
             
             reply_markup = get_tone_keyboard("plan_tone")
             
             await message.reply_text(
-                "🎭 **Шаг 2 из 3:** Выберите тон контента:",
+                "🎭 **Шаг 3 из 4:** Выберите тон контента:",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
@@ -291,7 +655,9 @@ class ContentPlanManager:
                 plan_type=plan_data['content_plan_type'],
                 niche=plan_data['content_plan_niche'],
                 tone=plan_data['content_plan_tone'],
-                posts_per_week=plan_data.get('content_plan_posts_count', 7)
+                posts_per_week=plan_data.get('content_plan_posts_count', 7),
+                audience=plan_data.get('content_plan_audience', 'подписчики Telegram-канала'),
+                goals=plan_data.get('content_plan_goals', 'вовлечение и рост аудитории')
             )
             
             plan_name = f"{plan_data['content_plan_type']} план - {plan_data['content_plan_niche']}"
@@ -327,7 +693,11 @@ class ContentPlanManager:
                 plan_text += f"**{post['date']}**\n"
             
             plan_text += f"🎯 Тема: {post.get('topic', 'Без темы')}\n"
-            plan_text += f"💡 Идея: {post.get('main_idea', 'Без описания')}\n\n"
+            plan_text += f"📝 Тип: {post.get('post_type', 'Не указан')}\n"
+            plan_text += f"💡 Идея: {post.get('main_idea', 'Без описания')}\n"
+            plan_text += f"🎭 Тон: {post.get('tone', 'Не указан')}\n"
+            plan_text += f"🔗 Вовлечение: {post.get('engagement_elements', 'Не указано')}\n"
+            plan_text += f"🏷️ Хештеги: {post.get('hashtags', 'Не указаны')}\n\n"
         
         plan_text += "✅ Контент-план сохранен!"
         
@@ -342,6 +712,35 @@ class ContentPlanManager:
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
+
+    async def get_user_content_plans(self, user_id: int) -> List[Dict]:
+        """Получение контент-планов пользователя"""
+        cursor = self.db.conn.cursor()
+        cursor.execute('''
+            SELECT id, plan_name, plan_type, start_date, end_date, plan_data, created_at
+            FROM content_plans 
+            WHERE user_id = ? AND status = 'active'
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        
+        plans = []
+        for row in cursor.fetchall():
+            plan_id, plan_name, plan_type, start_date, end_date, plan_data, created_at = row
+            try:
+                plan_json = json.loads(plan_data) if plan_data else {}
+                plans.append({
+                    'id': plan_id,
+                    'name': plan_name,
+                    'type': plan_type,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'plan_data': plan_json,
+                    'created_at': created_at
+                })
+            except Exception as e:
+                logger.error(f"❌ Ошибка парсинга контент-плана {plan_id}: {e}")
+        
+        return plans
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def get_user_display_name(user, message) -> str:
@@ -364,6 +763,65 @@ async def get_user_display_name(user, message) -> str:
         return "друг"
     except Exception:
         return "пользователь"
+       
+async def check_messages_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка статуса сообщений в БД"""
+    try:
+        db = context.bot_data['db']
+        cursor = db.conn.cursor()
+        
+        # Получаем статистику по статусам сообщений
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN is_spam IS NULL AND response_text IS NULL THEN 1 ELSE 0 END) as unprocessed,
+                SUM(CASE WHEN is_spam = 1 THEN 1 ELSE 0 END) as spam,
+                SUM(CASE WHEN is_spam = 0 THEN 1 ELSE 0 END) as legitimate,
+                SUM(CASE WHEN is_spam IS NOT NULL AND response_text IS NULL THEN 1 ELSE 0 END) as processed_no_response,
+                SUM(CASE WHEN is_spam IS NULL AND response_text IS NOT NULL THEN 1 ELSE 0 END) as response_no_spam_flag
+            FROM message_history 
+            WHERE timestamp >= datetime('now', '-24 hours')
+        ''')
+        
+        stats = cursor.fetchone()
+        
+        response = "📊 **Статус сообщений за последние 24 часа:**\n\n"
+        response += f"• Всего сообщений: {stats[0] or 0}\n"
+        response += f"• Необработанных: {stats[1] or 0}\n"
+        response += f"• Спам: {stats[2] or 0}\n"
+        response += f"• Легитимных: {stats[3] or 0}\n"
+        response += f"• Обработано без ответа: {stats[4] or 0}\n"
+        response += f"• Ответ без флага спама: {stats[5] or 0}\n\n"
+        
+        # Показываем несколько примеров каждого типа
+        cursor.execute('''
+            SELECT id, user_id, message_text, is_spam, response_text
+            FROM message_history 
+            WHERE timestamp >= datetime('now', '-24 hours')
+            ORDER BY timestamp DESC
+            LIMIT 10
+        ''')
+        
+        recent_messages = cursor.fetchall()
+        
+        response += "**Последние 10 сообщений:**\n"
+        for msg in recent_messages:
+            status = "❓ Необработанное"
+            if msg[3] == 1:
+                status = "🚫 Спам"
+            elif msg[3] == 0:
+                status = "✅ Легитимное"
+            
+            response += f"• ID:{msg[0]} - {status}\n"
+            response += f"  Текст: {msg[2][:30]}...\n"
+            if msg[4]:
+                response += f"  Ответ: {msg[4][:30]}...\n"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки статуса сообщений: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def safe_reply_to_message(message, reply_text: str, username: str):
     """Безопасная отправка ответа на сообщение"""
@@ -441,6 +899,20 @@ def clean_message_text(text: str) -> str:
     
     return text.strip()
 
+async def save_unprocessed_message(context, message):
+    """Сохранение непроцессированного сообщения при сетевых ошибках"""
+    try:
+        if message and message.text and message.from_user:
+            cursor = context.bot_data['db'].execute_with_datetime('''
+                INSERT INTO message_history 
+                (user_id, message_text, timestamp, is_spam, response_text)
+                VALUES (?, ?, ?, NULL, NULL)
+            ''', (message.from_user.id, message.text, datetime.now()))
+            context.bot_data['db'].conn.commit()
+            logger.info(f"💾 Сохранено непроцессированное сообщение от {message.from_user.id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения непроцессированного сообщения: {e}")
+
 # === ОБРАБОТЧИКИ СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -448,6 +920,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = message.from_user
+    
+    # Проверяем, нужно ли обрабатывать это сообщение
+    if not await should_process_message(message):
+        return
+
     text = clean_message_text(message.text)
     
     logger.info(f"💬 Сообщение от {user.first_name or user.id}: {text[:50]}...")
@@ -456,7 +933,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_channel_comment(update, context)
         return
 
-    if not await context.application.context_data['rate_limiter'].check_limit(user.id):
+    if not await context.bot_data['rate_limiter'].check_limit(user.id):
         try:
             await message.reply_text("⚠️ Слишком много сообщений. Подождите немного.")
             return
@@ -464,43 +941,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    await context.application.context_data['rate_limiter'].record_message(user.id, text)
+    await context.bot_data['rate_limiter'].record_message(user.id, text)
 
-    is_spam, spam_score = await context.application.context_data['moderation'].advanced_spam_check(text, user.id)
+    is_spam, spam_score = await context.bot_data['moderation'].advanced_spam_check(text, user.id)
     
     if is_spam:
-        await handle_spam(message, user, spam_score)
+        await handle_spam(message, user, spam_score, context)
     else:
         await handle_legitimate_message(message, user, text, context)
 
 async def handle_channel_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = message.from_user
+    
+    # Проверяем, нужно ли обрабатывать это сообщение
+    if not await should_process_message(message):
+        return
+    
+    # Пропускаем посты канала
+    if await is_channel_post(message):
+        logger.info("⏩ Пропущен пост канала")
+        return
+        
+    # Пропускаем сообщения администраторов
+    if user and await is_admin_user(context.bot, user.id, CHANNEL_ID):
+        logger.info(f"⏩ Пропущено сообщение администратора {user.first_name}")
+        return
+        
     text = clean_message_text(message.text)
     
     if not user or not text:
         return
+    
+    # Пропускаем ответы на автоматические посты бота (утренние и вечерние)
+    if is_auto_post_message(text):
+        logger.info(f"⏩ Пропущен комментарий к авто-посту от {user.first_name}")
+        return
         
     logger.info(f"💬 Комментарий в канале от {user.first_name or 'анонимного пользователя'}: {text[:50]}...")
 
-    is_spam, spam_score = await context.application.context_data['moderation'].advanced_spam_check(text, user.id)
+    is_spam, spam_score = await context.bot_data['moderation'].advanced_spam_check(text, user.id)
     
     if is_spam:
-        await handle_spam(message, user, spam_score)
+        await handle_spam(message, user, spam_score, context)
         return
 
-    if not await context.application.context_data['rate_limiter'].check_limit(user.id):
+    if not await context.bot_data['rate_limiter'].check_limit(user.id):
         logger.info(f"⏰ Rate limit для комментария от {user.first_name or 'анонимного пользователя'}")
         return
 
-    await context.application.context_data['rate_limiter'].record_message(user.id, text)
+    await context.bot_data['rate_limiter'].record_message(user.id, text)
 
     try:
         username = await get_user_display_name(user, message)
         
         logger.info(f"🤖 Генерация ответа на комментарий от {username}")
         
-        reply_text = await context.application.context_data['response_generator'].generate_context_aware_reply(
+        reply_text = await context.bot_data['response_generator'].generate_context_aware_reply(
             text, user.id, username
         )
         
@@ -508,22 +1005,93 @@ async def handle_channel_comment(update: Update, context: ContextTypes.DEFAULT_T
         await safe_reply_to_message(message, reply_text, username)
         
         # Сохраняем активность
-        await save_user_activity(context.application.context_data['db'], user, username)
+        await save_user_activity(context.bot_data['db'], user, username)
+        
+        # Сохраняем в базу данных как обработанное сообщение
+        cursor = context.bot_data['db'].execute_with_datetime('''
+            INSERT INTO message_history 
+            (user_id, message_text, timestamp, is_spam, response_text)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (
+            user.id, 
+            text, 
+            datetime.now(), 
+            False, 
+            reply_text[:500]  # Сохраняем только часть ответа
+        ))
+        context.bot_data['db'].conn.commit()
         
     except Exception as e:
         logger.error(f"❌ Ошибка отправки ответа на комментарий: {e}")
+        # Сохраняем как непроцессированное для последующего восстановления
+        await save_unprocessed_message(context, message)
 
-async def handle_spam(message, user, spam_score):
+async def handle_spam(message, user, spam_score, context):
     try:
+        # Сохраняем сообщение в БД КАК СПАМ перед удалением
+        try:
+            cursor = context.bot_data['db'].execute_with_datetime('''
+                INSERT INTO message_history 
+                (user_id, message_text, timestamp, is_spam, response_text)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                user.id, 
+                message.text if message.text else "Нет текста", 
+                datetime.now(), 
+                True, 
+                f"Удалено как спам (score: {spam_score:.1f})"
+            ))
+            context.bot_data['db'].conn.commit()
+            logger.info(f"💾 Спам сообщение сохранено в БД для пользователя {user.id}")
+        except Exception as db_error:
+            logger.error(f"❌ Ошибка сохранения спама в БД: {db_error}")
+
+        # Теперь удаляем сообщение
         await message.delete()
-        logger.warning(f"🛡️ Удален спам от {user.first_name or user.id} (score: {spam_score})")
+        logger.warning(f"🛡️ Удален спам от {user.first_name or user.id} (score: {spam_score:.1f})")
         
-        if spam_score >= 5 and Config.NOTIFY_ON_SPAM:
-            notification_system = message._bot.context_data.get('notification_system')
+        # Обновляем статистику пользователя в системе модерации
+        moderation = context.bot_data['moderation']
+        user_stats = moderation.get_user_stats(user.id)
+        
+        # Уведомление администраторов
+        if Config.NOTIFY_ON_SPAM:
+            notification_system = context.bot_data.get('notification_system')
             if notification_system:
-                notification = f"🚨 Высокий уровень спама (score: {spam_score})\nОт: {user.first_name or user.id}\nТекст: {message.text[:100]}..."
+                notification = (
+                    f"🚨 Обнаружен спам (score: {spam_score:.1f})\n"
+                    f"👤 От: {user.first_name or user.id}\n"
+                    f"📊 Уровень доверия: {user_stats['trust_level']}\n"
+                    f"📝 Текст: {message.text[:100]}...\n"
+                    f"✅ Сообщение удалено и сохранено в статистике"
+                )
                 await notification_system.notify_admins(notification)
+        
+        # Автоматический бан при множественных нарушениях
+        if user_stats['warning_count'] >= 2:
+            try:
+                await context.bot.ban_chat_member(
+                    chat_id=CHANNEL_ID,
+                    user_id=user.id,
+                    until_date=datetime.now() + timedelta(days=1)
+                )
+                logger.warning(f"🔨 Пользователь {user.id} забанен на 1 день")
+                
+                if notification_system:
+                    ban_notification = (
+                        f"🔨 Пользователь забанен за спам\n"
+                        f"👤 ID: {user.id}\n"
+                        f"📛 Имя: {user.first_name or 'Неизвестно'}\n"
+                        f"⚠️ Предупреждений: {user_stats['warning_count']}\n"
+                        f"📊 Уровень доверия: {user_stats['trust_level']}"
+                    )
+                    await notification_system.notify_admins(ban_notification)
+                    
+            except Exception as ban_error:
+                logger.error(f"❌ Не удалось забанить пользователя {user.id}: {ban_error}")
             
+    except Forbidden as e:
+        logger.error(f"❌ Нет прав для удаления сообщения от {user.id}: {e}")
     except Exception as e:
         logger.error(f"❌ Не удалось удалить спам: {e}")
 
@@ -534,40 +1102,105 @@ async def handle_legitimate_message(message, user, text, context):
         
         logger.info(f"🤖 Генерация ответа для {username} на сообщение: {text[:50]}...")
         
-        reply_text = await context.application.context_data['response_generator'].generate_context_aware_reply(
+        reply_text = await context.bot_data['response_generator'].generate_context_aware_reply(
             text, user.id, username
         )
+        
+        # Сохраняем сообщение в БД как НЕ спам
+        try:
+            cursor = context.bot_data['db'].execute_with_datetime('''
+                INSERT INTO message_history 
+                (user_id, message_text, timestamp, is_spam, response_text)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                user.id, 
+                text, 
+                datetime.now(), 
+                False, 
+                reply_text[:500]  # Сохраняем только часть ответа
+            ))
+            context.bot_data['db'].conn.commit()
+        except Exception as db_error:
+            logger.error(f"❌ Ошибка сохранения сообщения в БД: {db_error}")
         
         # Безопасная отправка ответа
         await safe_reply_to_message(message, reply_text, username)
         
-        # Сохраняем в базу
-        await save_user_activity(context.application.context_data['db'], user, username)
+        # Сохраняем активность
+        await save_user_activity(context.bot_data['db'], user, username)
         
     except Exception as e:
         logger.error(f"❌ Ошибка обработки сообщения от {user.id}: {e}")
         await handle_message_error(message, user, e)
+        # Сохраняем как непроцессированное для последующего восстановления
+        await save_unprocessed_message(context, message)
+        
+async def update_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительное обновление статистики"""
+    try:
+        await update.message.reply_text("🔄 Обновляю статистику...")
+        
+        # Пересчитываем статистику
+        db = context.bot_data['db']
+        cursor = db.conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) FROM message_history WHERE is_spam = TRUE')
+        spam_count = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM message_history')
+        total_count = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM message_history WHERE is_spam IS NULL AND response_text IS NULL')
+        unprocessed_count = cursor.fetchone()[0]
+        
+        await update.message.reply_text(
+            f"📊 **Обновленная статистика:**\n"
+            f"• Всего сообщений в БД: {total_count}\n"
+            f"• Спам сообщений в БД: {spam_count}\n"
+            f"• Необработанных сообщений: {unprocessed_count}\n"
+            f"• Эффективность: {spam_count/max(1, total_count)*100:.1f}%",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления статистики: {e}")
+        await update.message.reply_text("❌ Ошибка при обновлении статистики")
 
 # === ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ ===
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главный обработчик всех сообщений"""
-    
-    # Обработка контент-планов
-    if context.user_data.get('content_plan_stage'):
-        stage = context.user_data.get('content_plan_stage')
-        if stage in ['niche', 'posts_count']:
-            await context.application.context_data['content_plan_manager'].handle_content_plan_creation(update, context)
+    try:
+        # Обработка контент-планов
+        if context.user_data.get('content_plan_stage'):
+            stage = context.user_data.get('content_plan_stage')
+            if stage in ['niche', 'audience', 'posts_count']:
+                await context.bot_data['content_plan_manager'].handle_content_plan_creation(update, context)
+                return
+        
+        # Обработка создания постов
+        if context.user_data.get('creating_post'):
+            stage = context.user_data.get('post_stage')
+            if stage in ['topic', 'main_idea', 'schedule_time']:
+                await context.bot_data['post_creator'].handle_post_creation(update, context)
+                return
+        
+        # Обработка планирования постов из контент-плана
+        if context.user_data.get('scheduling_plan_post'):
+            await context.bot_data['post_creator'].handle_plan_post_scheduling(update, context)
             return
-    
-    # Обработка создания постов
-    if context.user_data.get('creating_post'):
-        stage = context.user_data.get('post_stage')
-        if stage in ['topic', 'main_idea', 'schedule_time']:
-            await context.application.context_data['post_creator'].handle_post_creation(update, context)
-            return
-    
-    # Обработка обычных сообщений
-    await handle_message(update, context)
+        
+        # Обработка обычных сообщений
+        await handle_message(update, context)
+        
+    except NetworkError as e:
+        logger.error(f"🌐 Сетевая ошибка: {e}")
+        # Сохраняем сообщение как непроцессированное
+        await save_unprocessed_message(context, update.effective_message)
+        
+    except Exception as e:
+        logger.error(f"❌ Неизвестная ошибка: {e}")
+        # Сохраняем сообщение как непроцессированное
+        await save_unprocessed_message(context, update.effective_message)
 
 # === КОМАНДЫ БОТА ===
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -594,8 +1227,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        db = context.application.context_data['db']
-        cache = context.application.context_data['cache']
+        db = context.bot_data['db']
+        cache = context.bot_data['cache']
         
         cursor = db.conn.cursor()
         
@@ -611,6 +1244,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute('SELECT COUNT(*) FROM scheduled_posts WHERE status = "scheduled"')
         scheduled_posts = cursor.fetchone()[0]
         
+        cursor.execute('SELECT COUNT(*) FROM content_plans')
+        content_plans = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM message_history WHERE is_spam IS NULL AND response_text IS NULL')
+        unprocessed_messages = cursor.fetchone()[0]
+        
         cache_stats = cache.get_stats()
         
         stats_text = f"""📊 **Статистика бота**
@@ -619,6 +1258,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 🛡️ Заблокировано спама: {spam_blocked}
 • 👥 Уникальных пользователей: {unique_users}
 • 📅 Запланировано постов: {scheduled_posts}
+• 📋 Контент-планов: {content_plans}
+• ⏳ Необработанных сообщений: {unprocessed_messages}
 • 💾 Эффективность кэша: {cache_stats['hit_rate']:.1%}
 • ⏰ Авто-посты: активны
 
@@ -692,9 +1333,9 @@ async def test_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from config import MORNING_POST_TIME, EVENING_POST_TIME
     
-    help_text = f"""🤖 **Помощь по MamaAI Боту**
+    help_text = f"""🤖 Помощь по MamaAI Боту
 
-**Основные команды:**
+Основные команды:
 /start - главное меню
 /stats - статистика бота
 /status - статус системы
@@ -703,9 +1344,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /content_plan - создать контент-план
 /scheduled_posts - запланированные посты
 /check_permissions - проверить права бота
+/moderation_stats - статистика модерации
+/my_trust - мой уровень доверия
+/my_content_plans - мои контент-планы
+/force_recovery - восстановить пропущенные сообщения
+/update_stats - обновить статистику
 /help - эта справка
 
-**Автоматические функции:**
+Автоматические функции:
 • Модерация спама (AI проверка)
 • Ответы на комментарии (AI генерация)
 • Утренние посты: {MORNING_POST_TIME.strftime('%H:%M')}
@@ -715,9 +1361,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Бот работает полностью автоматически! 🎯"""
     
     if update.message:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        await update.message.reply_text(help_text)
     elif update.callback_query:
-        await update.callback_query.edit_message_text(help_text, parse_mode='Markdown')
+        await update.callback_query.edit_message_text(help_text)
 
 async def create_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['creating_post'] = True
@@ -756,7 +1402,7 @@ async def content_plan_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def scheduled_posts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        stats = await context.application.context_data['post_scheduler'].get_scheduled_posts_stats()
+        stats = await context.bot_data['post_scheduler'].get_scheduled_posts_stats()
         
         response = "📅 **Запланированные посты**\n\n"
         
@@ -797,7 +1443,7 @@ async def check_permissions_command(update: Update, context: ContextTypes.DEFAUL
         elif update.callback_query:
             await update.callback_query.edit_message_text("🔍 Проверяю права бота в канале...")
         
-        has_permissions = await check_bot_permissions(context.application)
+        has_permissions = await check_bot_permissions(context.application.bot, CHANNEL_ID)
         
         if has_permissions:
             response = (
@@ -832,7 +1478,7 @@ async def force_check_scheduled_posts(update: Update, context: ContextTypes.DEFA
     """Принудительная проверка запланированных постов"""
     try:
         await update.message.reply_text("🔍 Проверяю запланированные посты...")
-        await context.application.context_data['post_scheduler']._check_scheduled_posts()
+        await context.bot_data['post_scheduler']._check_scheduled_posts()
         await update.message.reply_text("✅ Проверка завершена")
     except Exception as e:
         logger.error(f"❌ Ошибка принудительной проверки: {e}")
@@ -847,13 +1493,238 @@ async def force_auto_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Используйте: /force_auto_post morning или /force_auto_post evening")
             return
         
-        auto_post_scheduler = context.application.context_data['auto_post_scheduler']
+        auto_post_scheduler = context.bot_data['auto_post_scheduler']
         await auto_post_scheduler._publish_post(post_type)
         await update.message.reply_text(f"✅ {post_type} пост опубликован принудительно")
         
     except Exception as e:
         logger.error(f"❌ Ошибка принудительной публикации: {e}")
         await update.message.reply_text("❌ Ошибка при публикации поста")
+
+async def moderation_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика модерации"""
+    try:
+        moderation = context.bot_data['moderation']
+        stats = moderation.get_moderation_stats()
+        
+        stats_text = f"""🛡️ **Статистика модерации**
+
+• 📊 Всего проверено: {stats['total_checked']}
+• 🚨 Обнаружено спама: {stats['spam_detected']}
+• 🤖 AI проверок: {stats['ai_checks']}
+• ⚠️ Ложных срабатываний: {stats['false_positives']}
+
+**Эффективность:** {stats['spam_detected']/max(1, stats['total_checked'])*100:.1f}%"""
+        
+        if update.message:
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(stats_text, parse_mode='Markdown')
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики модерации: {e}")
+
+async def user_trust_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка доверия пользователя"""
+    try:
+        user = update.effective_user
+        moderation = context.bot_data['moderation']
+        user_stats = moderation.get_user_stats(user.id)
+        
+        trust_emoji = {
+            'trusted': '🟢',
+            'neutral': '🟡', 
+            'suspicious': '🟠',
+            'banned': '🔴'
+        }
+        
+        trust_text = f"""👤 **Ваш уровень доверия**
+
+{trust_emoji[user_stats['trust_level']]} **Уровень:** {user_stats['trust_level'].upper()}
+📊 **Очков доверия:** {user_stats['trust_score']}/100
+💬 **Сообщений:** {user_stats['message_count']}
+⚠️ **Предупреждений:** {user_stats['warning_count']}
+🚨 **Спам-сообщений:** {user_stats['spam_count']}
+
+**Рекомендации:**
+• Отправляйте содержательные сообщения
+• Избегайте коммерческих предложений
+• Не спамьте ссылками"""
+        
+        if update.message:
+            await update.message.reply_text(trust_text, parse_mode='Markdown')
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(trust_text, parse_mode='Markdown')
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки доверия: {e}")
+
+async def my_content_plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать контент-планы пользователя"""
+    user = update.effective_user
+    
+    try:
+        content_plan_manager = context.bot_data['content_plan_manager']
+        plans = await content_plan_manager.get_user_content_plans(user.id)
+        
+        if not plans:
+            if update.message:
+                await update.message.reply_text(
+                    "📭 У вас пока нет созданных контент-планов.\n\n"
+                    "Создайте первый контент-план через меню или командой /content_plan",
+                    parse_mode='Markdown'
+                )
+            elif update.callback_query:
+                await update.callback_query.edit_message_text(
+                    "📭 У вас пока нет созданных контент-планов.\n\n"
+                    "Создайте первый контент-план через меню или командой /content_plan",
+                    parse_mode='Markdown'
+                )
+            return
+        
+        # Показываем первый план, остальные через кнопки
+        await show_content_plan_details(update, context, plans[0], 0, len(plans))
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения контент-планов: {e}")
+        error_text = "❌ Ошибка при получении контент-планов"
+        if update.message:
+            await update.message.reply_text(error_text)
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(error_text)
+
+async def show_content_plan_details(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: Dict, current_index: int, total_plans: int):
+    """Показать детали контент-плана"""
+    plan_text = f"📅 **{plan['name']}**\n\n"
+    plan_text += f"📊 **Тип:** {plan['type']}\n"
+    plan_text += f"📅 **Период:** {plan['start_date']} - {plan['end_date']}\n\n"
+    
+    # Показываем первые 5 постов из плана
+    plan_data = plan.get('plan_data', {})
+    posts = plan_data.get('plan', [])
+    
+    if posts:
+        plan_text += "**Посты в плане:**\n\n"
+        for i, post in enumerate(posts[:5]):
+            day_info = post.get('day', '') or post.get('date', '')
+            plan_text += f"**{i+1}. {day_info}**\n"
+            plan_text += f"🎯 Тема: {post.get('topic', 'Без темы')}\n"
+            plan_text += f"📝 Тип: {post.get('post_type', 'Не указан')}\n"
+            plan_text += f"💡 Идея: {post.get('main_idea', 'Без описания')[:50]}...\n\n"
+    else:
+        plan_text += "📭 В плане пока нет постов\n\n"
+    
+    # Создаем клавиатуру навигации
+    keyboard = []
+    if total_plans > 1:
+        nav_buttons = []
+        if current_index > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"plan_nav_{current_index-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"{current_index+1}/{total_plans}", callback_data="plan_info"))
+        if current_index < total_plans - 1:
+            nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"plan_nav_{current_index+1}"))
+        keyboard.append(nav_buttons)
+    
+    # Кнопки для работы с постами
+    if posts:
+        keyboard.append([InlineKeyboardButton("🎯 Сгенерировать пост из этого плана", callback_data=f"select_plan_post_{plan['id']}")])
+    
+    keyboard.extend([
+        [InlineKeyboardButton("🗑️ Удалить план", callback_data=f"delete_plan_{plan['id']}")],
+        [InlineKeyboardButton("↩️ Назад к списку", callback_data="my_content_plans")]
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.message:
+        await update.message.reply_text(plan_text, reply_markup=reply_markup, parse_mode='Markdown')
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(plan_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def select_plan_post(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_id: int):
+    """Выбор поста из контент-плана для генерации"""
+    user = update.effective_user
+    query = update.callback_query
+    
+    try:
+        # Получаем контент-план
+        cursor = context.bot_data['db'].conn.cursor()
+        cursor.execute('''
+            SELECT plan_data, plan_name FROM content_plans 
+            WHERE id = ? AND user_id = ?
+        ''', (plan_id, user.id))
+        
+        result = cursor.fetchone()
+        if not result:
+            await query.edit_message_text("❌ Контент-план не найден")
+            return
+        
+        plan_data_json, plan_name = result
+        plan_data = json.loads(plan_data_json) if plan_data_json else {}
+        posts = plan_data.get('plan', [])
+        
+        if not posts:
+            await query.edit_message_text("❌ В контент-плане нет постов")
+            return
+        
+        # Создаем клавиатуру с постами
+        keyboard = []
+        for i, post in enumerate(posts):
+            day_info = post.get('day', '') or post.get('date', '')
+            post_title = f"{i+1}. {day_info} - {post.get('topic', 'Без темы')[:30]}..."
+            keyboard.append([InlineKeyboardButton(post_title, callback_data=f"generate_plan_post_{plan_id}_{i}")])
+        
+        keyboard.append([InlineKeyboardButton("↩️ Назад к плану", callback_data=f"plan_nav_0")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"📝 **Выберите пост для генерации из плана:**\n**{plan_name}**\n\n"
+            f"Всего постов в плане: {len(posts)}",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка выбора поста из контент-плана: {e}")
+        await query.edit_message_text("❌ Ошибка при выборе поста")
+
+async def force_recovery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительный запуск восстановления пропущенных сообщений"""
+    try:
+        await update.message.reply_text("🔄 Запуск принудительного восстановления пропущенных сообщений...")
+        
+        recovery_system = context.bot_data.get('recovery_system')
+        if recovery_system:
+            # Получаем параметр часов из аргументов команды
+            hours_back = 24
+            if context.args and context.args[0].isdigit():
+                hours_back = min(int(context.args[0]), 168)  # Максимум 7 дней
+            
+            result = await recovery_system.force_recovery(hours_back)
+            
+            if result["success"]:
+                stats = result.get("stats", {})
+                response = (
+                    f"✅ **Принудительное восстановление завершено!**\n\n"
+                    f"📊 **Результаты:**\n"
+                    f"• Всего сообщений: {stats.get('total_messages', 0)}\n"
+                    f"• Обработано: {stats.get('processed', 0)}\n"
+                    f"• Спама обнаружено: {stats.get('spam_detected', 0)}\n"
+                    f"• Ошибок: {stats.get('errors', 0)}\n"
+                    f"• Успешность: {stats.get('success_rate', 0):.1f}%\n\n"
+                    f"⏰ Период: последние {hours_back} часов"
+                )
+            else:
+                response = f"❌ **Ошибка восстановления:** {result['message']}"
+            
+            await update.message.reply_text(response, parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ Система восстановления недоступна")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка принудительного восстановления: {e}")
+        await update.message.reply_text("❌ Ошибка при восстановлении")
 
 # === ОБРАБОТЧИКИ CALLBACK ===
 async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -865,10 +1736,47 @@ async def handle_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     
     logger.info(f"🔔 Callback: {data} от {user.id}")
     
-    if data in ["stats", "status", "auto_posts", "create_post", "content_plan", "help", "scheduled_posts", "check_permissions", "main_menu"]:
+    if data in ["stats", "status", "auto_posts", "create_post", "content_plan", "help", "scheduled_posts", "check_permissions", "main_menu", "my_content_plans"]:
         await handle_main_menu_callback(update, context)
     elif any(data.startswith(prefix) for prefix in ["tone_", "length_", "emojis_", "publish_now", "schedule_later"]):
         await handle_post_creation_callback(update, context)
+    elif data.startswith('plan_nav_'):
+        # Навигация по контент-планам
+        plan_index = int(data.split('_')[2])
+        user = query.from_user
+        content_plan_manager = context.bot_data['content_plan_manager']
+        plans = await content_plan_manager.get_user_content_plans(user.id)
+        
+        if 0 <= plan_index < len(plans):
+            await show_content_plan_details(update, context, plans[plan_index], plan_index, len(plans))
+    elif data.startswith('select_plan_post_'):
+        # Выбор поста из контент-плана
+        plan_id = int(data.split('_')[3])
+        await select_plan_post(update, context, plan_id)
+    elif data.startswith('generate_plan_post_'):
+        # Генерация поста из контент-плана
+        parts = data.split('_')
+        plan_id = int(parts[3])
+        post_index = int(parts[4])
+        await context.bot_data['post_creator'].generate_post_from_plan(update, context, plan_id, post_index)
+    elif data.startswith('publish_plan_post_'):
+        # Публикация поста из контент-плана
+        parts = data.split('_')
+        plan_id = int(parts[3])
+        post_index = int(parts[4])
+        await context.bot_data['post_creator'].publish_plan_post(update, context, plan_id, post_index)
+    elif data.startswith('schedule_plan_post_'):
+        # Планирование поста из контент-плана
+        parts = data.split('_')
+        plan_id = int(parts[3])
+        post_index = int(parts[4])
+        await context.bot_data['post_creator'].schedule_plan_post(update, context, plan_id, post_index)
+    elif data.startswith('regenerate_plan_post_'):
+        # Регенерация поста из контент-плана
+        parts = data.split('_')
+        plan_id = int(parts[3])
+        post_index = int(parts[4])
+        await context.bot_data['post_creator'].generate_post_from_plan(update, context, plan_id, post_index)
     else:
         await handle_content_plan_callback(update, context)
 
@@ -887,6 +1795,8 @@ async def handle_main_menu_callback(update: Update, context: ContextTypes.DEFAUL
             await create_post_command(update, context)
         elif data == "content_plan":
             await content_plan_command(update, context)
+        elif data == "my_content_plans":
+            await my_content_plans_command(update, context)
         elif data == "scheduled_posts":
             await scheduled_posts_command(update, context)
         elif data == "check_permissions":
@@ -937,7 +1847,7 @@ async def handle_post_creation_callback(update: Update, context: ContextTypes.DE
         await query.edit_message_text("🤖 Генерирую пост... ⏳")
         
         try:
-            generated_post = await context.application.context_data['response_generator'].generate_post(
+            generated_post = await context.bot_data['response_generator'].generate_post(
                 topic=context.user_data['post_topic'],
                 tone=context.user_data['post_tone'],
                 main_idea=context.user_data['post_main_idea'],
@@ -969,7 +1879,7 @@ async def handle_post_creation_callback(update: Update, context: ContextTypes.DE
             success = await send_message_with_fallback(context.application, CHANNEL_ID, context.user_data['generated_post'])
             
             if success:
-                cursor = context.application.context_data['db'].execute_with_datetime('''
+                cursor = context.bot_data['db'].execute_with_datetime('''
                     INSERT INTO scheduled_posts 
                     (user_id, post_text, scheduled_time, channel_id, tone, topic, length, main_idea, status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -984,7 +1894,7 @@ async def handle_post_creation_callback(update: Update, context: ContextTypes.DE
                     context.user_data['post_main_idea'],
                     'published'
                 ))
-                context.application.context_data['db'].conn.commit()
+                context.bot_data['db'].conn.commit()
                 
                 context.user_data.clear()
                 await query.edit_message_text("✅ Пост успешно опубликован!", parse_mode='Markdown')
@@ -1025,16 +1935,16 @@ async def handle_content_plan_callback(update: Update, context: ContextTypes.DEF
     data = query.data
     
     if data == "content_plan_weekly":
-        await context.application.context_data['content_plan_manager'].create_content_plan(update, context, "weekly")
+        await context.bot_data['content_plan_manager'].create_content_plan(update, context, "weekly")
     elif data == "content_plan_monthly":
-        await context.application.context_data['content_plan_manager'].create_content_plan(update, context, "monthly")
+        await context.bot_data['content_plan_manager'].create_content_plan(update, context, "monthly")
     elif data.startswith('plan_tone_'):
         tone = data.split('_')[2]
         context.user_data['content_plan_tone'] = tone
         context.user_data['content_plan_stage'] = 'posts_count'
         
         await query.edit_message_text(
-            "�� **Шаг 3 из 3:** Введите количество постов (1-50):",
+            "📊 **Шаг 4 из 4:** Введите количество постов в неделю (1-50):",
             parse_mode='Markdown'
         )
 
@@ -1073,6 +1983,13 @@ def setup_handlers(app: Application):
     app.add_handler(CommandHandler("scheduled_posts", scheduled_posts_command))
     app.add_handler(CommandHandler("check_permissions", check_permissions_command))
     app.add_handler(CommandHandler("force_check", force_check_scheduled_posts))
+    app.add_handler(CommandHandler("force_auto_post", force_auto_post))
+    app.add_handler(CommandHandler("moderation_stats", moderation_stats_command))
+    app.add_handler(CommandHandler("my_trust", user_trust_command))
+    app.add_handler(CommandHandler("my_content_plans", my_content_plans_command))
+    app.add_handler(CommandHandler("update_stats", update_stats_command))
+    app.add_handler(CommandHandler("force_recovery", force_recovery_command))
+    app.add_handler(CommandHandler("check_messages", check_messages_status_command))
     
     # Универсальный обработчик callback
     app.add_handler(CallbackQueryHandler(handle_all_callbacks))

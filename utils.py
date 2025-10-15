@@ -135,8 +135,11 @@ def setup_logging():
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С КАНАЛОМ ===
 
-async def check_bot_permissions(bot, channel_id: str):
+async def check_bot_permissions(bot, channel_id: str = None):
     """Проверка прав бота в канале"""
+    if channel_id is None:
+        channel_id = CHANNEL_ID
+        
     try:
         chat = await bot.get_chat(channel_id)
         logging.info(f"✅ Канал найден: {chat.title}")

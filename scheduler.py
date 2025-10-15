@@ -131,17 +131,32 @@ class AutoPostScheduler:
         return True
     
     async def _publish_post(self, post_type: str):
-        """Публикация поста"""
+        """Публикация поста с улучшенной обработкой ошибок"""
         type_name = "утренний" if post_type == "morning" else "вечерний"
         type_emoji = "🌅" if post_type == "morning" else "🌙"
         
         try:
             logger.info(f"{type_emoji} Генерация {type_name} поста...")
-            post_text = await self.response_generator.generate_motivational_message(post_type)
             
-            if not post_text or len(post_text.strip()) < 10:
-                logger.error(f"❌ Сгенерирован пустой или слишком короткий {type_name} пост")
-                post_text = await self._get_fallback_post(post_type)
+            # Пробуем сгенерировать пост несколько раз
+            max_attempts = 2
+            post_text = None
+            
+            for attempt in range(max_attempts):
+                post_text = await self.response_generator.generate_motivational_message(post_type)
+                
+                # Проверяем качество
+                if post_text and len(post_text.strip()) >= 20:
+                    break
+                else:
+                    logger.warning(f"⚠️ Попытка {attempt + 1}: сгенерирован некачественный текст, пробуем снова")
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(1)  # Небольшая задержка между попытками
+            
+            # Если все попытки неудачны, используем fallback
+            if not post_text or len(post_text.strip()) < 20:
+                logger.error(f"❌ Все попытки генерации {type_name} поста провалились, используем fallback")
+                post_text = await self.response_generator._get_fallback_post(post_type)
             
             # Публикуем пост с обработкой ошибок
             success = await send_message_with_fallback(self.app, CHANNEL_ID, post_text)
@@ -165,7 +180,7 @@ class AutoPostScheduler:
                 
                 # Уведомляем администраторов
                 if Config.NOTIFY_ON_SPAM:
-                    notification_system = self.app.context_data.get('notification_system')
+                    notification_system = self.app.bot_data.get('notification_system')
                     if notification_system:
                         await notification_system.notify_admins(
                             f"{type_emoji} {type_name.capitalize()} пост опубликован в {post_time.strftime('%H:%M')}\n\n"
@@ -177,19 +192,13 @@ class AutoPostScheduler:
         except Exception as e:
             logger.error(f"❌ Ошибка публикации {type_name} поста: {e}")
             
+            # Всегда сохраняем ошибку в базу
             cursor = self.db.execute_with_datetime('''
                 INSERT INTO auto_posts_history 
                 (post_type, post_text, posted_at, success, error_message)
                 VALUES (?, ?, ?, ?, ?)
             ''', (post_type, "", datetime.now(), False, str(e)))
             self.db.conn.commit()
-    
-    async def _get_fallback_post(self, post_type: str) -> str:
-        """Резервные посты на случай ошибки генерации"""
-        if post_type == "morning":
-            return "☀️ Доброе утро! Новый день — новые возможности. Пусть сегодняшний день будет продуктивным и насыщенным позитивными событиями! 💫"
-        else:
-            return "🌙 Спокойной ночи! Отдыхайте и набирайтесь сил для новых свершений. Пусть ваши сны будут яркими и приятными! 💤"
     
     async def stop(self):
         """Остановка системы автоматических постов"""
@@ -278,7 +287,7 @@ class PostScheduler:
                     await self._mark_post_as_error(post_id, error_msg)
                     return
                     
-            except Forbidden as e:
+            except Exception as e:
                 if "bot is not a member" in str(e):
                     error_msg = "Бот не добавлен в канал"
                     logger.error(f"❌ {error_msg}")
@@ -301,7 +310,7 @@ class PostScheduler:
                 error_msg = "Не удалось опубликовать пост после нескольких попыток"
                 await self._mark_post_as_error(post_id, error_msg)
                 
-        except Forbidden as e:
+        except Exception as e:
             if "bot is not a member" in str(e):
                 error_msg = "Бот не является участником канала. Добавьте бота в канал как администратора."
                 logger.error(f"❌ {error_msg}")
@@ -309,9 +318,6 @@ class PostScheduler:
             else:
                 logger.error(f"❌ Ошибка публикации запланированного поста {post_id}: {e}")
                 await self._mark_post_as_error(post_id, str(e))
-        except Exception as e:
-            logger.error(f"❌ Ошибка публикации запланированного поста {post_id}: {e}")
-            await self._mark_post_as_error(post_id, str(e))
     
     async def _mark_post_as_published(self, post_id: int):
         """Отмечаем пост как опубликованный"""
